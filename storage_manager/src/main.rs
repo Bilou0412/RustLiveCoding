@@ -1,16 +1,17 @@
 use clap::{Parser, Subcommand};
+use futures::future::join_all;
 use std::env;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 
 // --- CONFIGURATION ---
 const FOLDERS: &[&str] = &[".rustup", ".vscode", ".cargo", "Downloads"];
 
 #[derive(Parser)]
 #[command(name = "42 Storage Manager")]
-#[command(about = "Gère la synchro entre Goinfre (SSD) et Sgoinfre (Cloud)", long_about = None)]
+#[command(about = "Version V3 : Architecture Archive (Ultra Rapide)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,145 +19,157 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialise le poste (Télécharge depuis Sgoinfre -> Crée les liens)
     Init,
-    /// Sauvegarde le travail (Upload vers Sgoinfre)
     Save,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-
     let user = env::var("USER").expect("Impossible de récupérer l'utilisateur");
     let home_dir = env::var("HOME").expect("Impossible de trouver le HOME");
+    
+    // Chemins
     let local_storage = format!("/goinfre/{}/local_data", user);
-    let remote_storage = format!("/sgoinfre/goinfre/Perso/{}/my_data", user);
+    // On ajoute un sous-dossier 'archives' pour séparer de l'ancienne version
+    let remote_storage = format!("/sgoinfre/goinfre/Perso/{}/my_archives", user);
 
     match &cli.command {
         Commands::Init => {
-            println!("🚀 Mode INIT activé");
+            println!("🚀 Mode INIT (Archive Extraction - Vitesse Max)");
             setup_directories(&local_storage, &remote_storage);
-            sync_and_link(&home_dir, &local_storage, &remote_storage);
+            run_parallel_task(&home_dir, &local_storage, &remote_storage, TaskType::Init).await;
         }
         Commands::Save => {
-            println!("💾 Mode SAVE activé");
-            save_work(&local_storage, &remote_storage);
+            println!("💾 Mode SAVE (Archivage Parallèle)");
+            setup_directories(&local_storage, &remote_storage);
+            run_parallel_task(&home_dir, &local_storage, &remote_storage, TaskType::Save).await;
         }
     }
 }
-
-// --- FONCTIONS MÉTIERS ---
 
 fn setup_directories(local: &str, remote: &str) {
     let _ = fs::create_dir_all(local);
     let _ = fs::create_dir_all(remote);
 }
 
-fn sync_and_link(home: &str, local_root: &str, remote_root: &str) {
-    for folder in FOLDERS {
-        let local_path = Path::new(local_root).join(folder);
-        let remote_path = Path::new(remote_root).join(folder);
-        let home_path = Path::new(home).join(folder);
-        let backup_path = Path::new(home).join(format!("{}_OLD", folder));
+#[derive(Clone, Copy)]
+enum TaskType {
+    Init,
+    Save,
+}
 
-        println!("\n📦 Traitement de : {}", folder);
+// Orchestrateur parallèle générique (sert pour Init et Save)
+async fn run_parallel_task(home: &str, local_root: &str, remote_root: &str, task: TaskType) {
+    let mut tasks = vec![];
 
-        // --- ÉTAPE 1 : Préparer le Goinfre (Destination) ---
-        if remote_path.exists() {
-            // Cas A : Cloud présent → Restauration depuis Sgoinfre
-            println!("  📥 Restauration depuis sgoinfre...");
-            let source_with_slash = format!("{}/", remote_path.to_str().unwrap());
-            run_rsync(&source_with_slash, local_path.to_str().unwrap());
-        } else if !local_path.exists() {
-            // Cas B : Pas de Cloud → Copier depuis le Home si nécessaire
+    for &folder_name in FOLDERS {
+        let home = home.to_string();
+        let local_root = local_root.to_string();
+        let remote_root = remote_root.to_string();
+        let folder = folder_name.to_string();
+
+        tasks.push(tokio::spawn(async move {
+            match task {
+                TaskType::Init => process_init(&home, &local_root, &remote_root, &folder).await,
+                TaskType::Save => process_save(&local_root, &remote_root, &folder).await,
+            }
+        }));
+    }
+
+    join_all(tasks).await;
+    println!("✨ Opération terminée !");
+}
+
+// --- LOGIQUE INIT (Décompression) ---
+async fn process_init(home: &str, local_root: &str, remote_root: &str, folder: &str) {
+    let local_path = Path::new(local_root).join(folder);
+    let remote_archive = Path::new(remote_root).join(format!("{}.tar", folder));
+    let home_path = Path::new(home).join(folder);
+    let backup_path = Path::new(home).join(format!("{}_OLD", folder));
+
+    println!("⚡ Start Init : {}", folder);
+
+    // 1. Restauration depuis l'archive (Si elle existe)
+    if remote_archive.exists() {
+        // Si le dossier local n'existe pas, on décompresse
+        if !local_path.exists() {
+            let _ = fs::create_dir_all(local_root); // On assure que le parent existe
+            
+            // Commande : tar -xf /remote/folder.tar -C /local/
+            // C'est ultra rapide car on lit un flux continu depuis le réseau
+            let status = Command::new("tar")
+                .arg("-xf")
+                .arg(&remote_archive)
+                .arg("-C")
+                .arg(local_root)
+                .status()
+                .await;
+
+            if status.is_ok() && status.unwrap().success() {
+                // Succès silencieux pour pas polluer les logs
+            } else {
+                eprintln!("❌ Erreur extraction {}", folder);
+            }
+        }
+    } else {
+        // Fallback : Si pas d'archive (premier lancement), on essaie de copier du Home
+        // (Logique Legacy pour transition en douceur)
+        if !local_path.exists() {
             let is_real_dir = if let Ok(m) = fs::symlink_metadata(&home_path) {
                 !m.file_type().is_symlink()
-            } else {
-                false
-            };
+            } else { false };
 
             if is_real_dir {
-                println!("  🚚 Copie de sécurité : Home -> Goinfre...");
-
-                // IMPORTANT : Utiliser rsync avec slash pour copier le CONTENU
-                // (comme pour la restauration depuis sgoinfre)
-                let source_with_slash = format!("{}/", home_path.to_str().unwrap());
-                let status = Command::new("rsync")
-                    .args(&[
-                        "-a",
-                        "--info=progress2",
-                        &source_with_slash,
-                        local_path.to_str().unwrap(),
-                    ])
-                    .status()
-                    .expect("Echec rsync");
-
-                if !status.success() {
-                    eprintln!("❌ ERREUR CRITIQUE : La copie a échoué. On ne touche à rien.");
-                    continue;
-                }
+                let _ = fs::create_dir_all(&local_path);
+                let src = format!("{}/", home_path.to_str().unwrap());
+                let _ = Command::new("rsync").args(&["-a", &src, local_path.to_str().unwrap()]).status().await;
             } else {
-                // Cas C : Rien nulle part → Créer un dossier vide
                 let _ = fs::create_dir_all(&local_path);
             }
         }
+    }
 
-        // --- ÉTAPE 2 : Gérer le Home ---
-        if let Ok(metadata) = fs::symlink_metadata(&home_path) {
-            if metadata.file_type().is_symlink() {
-                println!("  ✅ Lien déjà en place.");
-                continue;
-            }
-
-            // Si ce n'est pas un lien → Renommer pour sauvegarder
-            println!(
-                "  🛡️  Sauvegarde locale : Renommage vers {}...",
-                backup_path.display()
-            );
-
-            if backup_path.exists() {
-                let _ = fs::remove_dir_all(&backup_path);
-            }
-
-            match fs::rename(&home_path, &backup_path) {
-                Ok(_) => println!("  ✓ Renommage réussi."),
-                Err(e) => {
-                    eprintln!("❌ Impossible de renommer : {}. Arrêt.", e);
-                    continue;
-                }
-            }
-        }
-
-        // --- ÉTAPE 3 : Création du lien symbolique ---
-        println!("  🔗 Création du lien symbolique...");
-        if let Err(e) = symlink(&local_path, &home_path) {
-            eprintln!("  ❌ Erreur lien : {}", e);
-            // Rollback en cas d'échec
-            let _ = fs::rename(&backup_path, &home_path);
-        } else {
-            println!("  ✨ Succès !");
+    // 2. Gestion des liens (Identique à avant)
+    if let Ok(m) = fs::symlink_metadata(&home_path) {
+        if !m.file_type().is_symlink() {
+            if backup_path.exists() { let _ = fs::remove_dir_all(&backup_path); }
+            let _ = fs::rename(&home_path, &backup_path);
         }
     }
+    if !home_path.exists() && fs::symlink_metadata(&home_path).is_err() {
+        let _ = symlink(&local_path, &home_path);
+    }
+    
+    println!("✅ Ready : {}", folder);
 }
 
-fn save_work(local_root: &str, remote_root: &str) {
-    println!("\n☁️  UPLOAD vers Sgoinfre...");
-    let source = format!("{}/", local_root);
+// --- LOGIQUE SAVE (Compression) ---
+async fn process_save(local_root: &str, remote_root: &str, folder: &str) {
+    let local_path = Path::new(local_root).join(folder);
+    let remote_archive = Path::new(remote_root).join(format!("{}.tar", folder));
 
-    let status = Command::new("rsync")
-        .args(&["-av", "--info=progress2", &source, remote_root])
+    if !local_path.exists() {
+        return; // Rien à sauvegarder
+    }
+
+    println!("📦 Start Save (Tar) : {}", folder);
+
+    // Commande : tar -cf /remote/folder.tar -C /local/ folder
+    // On écrit directement l'archive sur le réseau.
+    // Pas de compression (-z) pour aller plus vite (le réseau de l'école encaisse le débit)
+    let status = Command::new("tar")
+        .arg("-cf")
+        .arg(&remote_archive)
+        .arg("-C")
+        .arg(local_root)
+        .arg(folder)
         .status()
-        .expect("Erreur rsync");
+        .await;
 
-    if status.success() {
-        println!("✅ Sauvegarde terminée avec succès !");
+    if status.is_ok() && status.unwrap().success() {
+        println!("✅ Saved : {}", folder);
     } else {
-        eprintln!("⚠️  Erreur lors de la sauvegarde.");
+        eprintln!("⚠️ Erreur sauvegarde {}", folder);
     }
-}
-
-fn run_rsync(src: &str, dest: &str) {
-    let _ = Command::new("rsync")
-        .args(&["-a", "--info=progress2", src, dest])
-        .status();
 }
